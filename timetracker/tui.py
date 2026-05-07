@@ -313,6 +313,9 @@ class TimeTrackerApp(App):
         Binding("d", "delete_timer", "删除"),
         Binding("e", "export_csv", "导出"),
         Binding("t", "manage_tz", "时区"),
+        Binding("s", "toggle_sort", "排序切换"),
+        Binding("[", "move_up", "上移"),
+        Binding("]", "move_down", "下移"),
         Binding("p", "start_pomodoro", "番茄钟"),
         Binding("c", "config_pomodoro", "番茄设置"),
         Binding("x", "cancel_pomodoro", "取消番茄"),
@@ -335,7 +338,7 @@ class TimeTrackerApp(App):
 
     def on_mount(self):
         self.title = "时间追踪器"
-        self.sub_title = "n=新建 空格=启停 p=番茄钟 t=时区 c=番茄设置 q=退出"
+        self._update_subtitle()
 
         table = self.query_one("#timer-table", DataTable)
         table.add_columns("ID", "名称", "状态", "今日", "本周", "本月", "累计")
@@ -400,12 +403,14 @@ class TimeTrackerApp(App):
     def autosave(self):
         self.service.checkpoint_all_running()
 
-    def refresh_table(self):
+    def refresh_table(self, focus_timer_id: Optional[int] = None):
         table = self.query_one("#timer-table", DataTable)
         cursor_row = table.cursor_row if table.row_count > 0 else 0
         table.clear()
 
-        for v in self.service.list_timer_views():
+        views = self.service.list_timer_views()
+        focus_row = cursor_row
+        for i, v in enumerate(views):
             status = "[bold green]● 运行中[/]" if v.is_running else "[dim]○ 暂停[/]"
             name = f"[bold]{v.name}[/]" if v.is_running else v.name
             table.add_row(
@@ -416,8 +421,10 @@ class TimeTrackerApp(App):
                 format_duration(v.total_seconds),
                 key=str(v.id),
             )
+            if focus_timer_id is not None and v.id == focus_timer_id:
+                focus_row = i
         if table.row_count > 0:
-            table.move_cursor(row=min(cursor_row, table.row_count - 1))
+            table.move_cursor(row=min(focus_row, table.row_count - 1))
 
     def refresh_pomo_bar(self, state):
         bar = self.query_one("#pomo-bar", Static)
@@ -541,6 +548,44 @@ class TimeTrackerApp(App):
 
     def action_config_pomodoro(self):
         self.push_screen(PomodoroConfigScreen(self.service), lambda _: None)
+
+    # ---------- 排序 ----------
+    def _update_subtitle(self):
+        mode = self.service.get_sort_mode()
+        mode_cn = "手动" if mode == "manual" else "按时长↓"
+        self.sub_title = (
+            f"n=新建 空格=启停 s=排序({mode_cn}) [/]=上下移  "
+            "p=番茄钟 t=时区 c=番茄设置 q=退出"
+        )
+
+    def action_toggle_sort(self):
+        mode = self.service.get_sort_mode()
+        new_mode = "auto_total_desc" if mode == "manual" else "manual"
+        self.service.set_sort_mode(new_mode)
+        mode_cn = "按时长降序" if new_mode == "auto_total_desc" else "手动排序"
+        self.set_status(f"排序方式已切换为: {mode_cn}  (手动排序时用 [ / ] 上下移动)")
+        self._update_subtitle()
+        self.refresh_table()
+
+    def action_move_up(self):
+        if self.service.get_sort_mode() != "manual":
+            self.set_status("当前为自动排序, 按 s 切换到手动排序后可上下移动")
+            return
+        tid = self._selected_timer_id()
+        if tid is None:
+            return
+        if self.service.move_timer(tid, -1):
+            self.refresh_table(focus_timer_id=tid)
+
+    def action_move_down(self):
+        if self.service.get_sort_mode() != "manual":
+            self.set_status("当前为自动排序, 按 s 切换到手动排序后可上下移动")
+            return
+        tid = self._selected_timer_id()
+        if tid is None:
+            return
+        if self.service.move_timer(tid, +1):
+            self.refresh_table(focus_timer_id=tid)
 
     # ---------- 退出 ----------
     def action_quit_app(self):

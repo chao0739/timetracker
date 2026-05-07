@@ -56,11 +56,21 @@ class Database:
                 last_start_ts TEXT,
                 last_checkpoint_ts TEXT,
                 created_at TEXT NOT NULL,
+                sort_order INTEGER,
                 UNIQUE (user_id, name),
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_timers_user ON timers(user_id)")
+
+        # 兼容旧库: 若 sort_order 列不存在则添加
+        try:
+            cur.execute("ALTER TABLE timers ADD COLUMN sort_order INTEGER")
+            self.conn.commit()
+        except Exception:
+            pass
+        # 初始化 sort_order 为 id (仅对 sort_order 为 NULL 的旧记录)
+        cur.execute("UPDATE timers SET sort_order = id WHERE sort_order IS NULL")
 
         # 会话日志: 每次启动到停止算一条
         cur.execute("""
@@ -127,7 +137,10 @@ class Database:
     # ---------- 计时器 ----------
     def list_timers(self, user_id: int):
         cur = self.conn.cursor()
-        cur.execute("SELECT * FROM timers WHERE user_id=? ORDER BY id ASC", (user_id,))
+        cur.execute(
+            "SELECT * FROM timers WHERE user_id=? ORDER BY sort_order ASC, id ASC",
+            (user_id,)
+        )
         return cur.fetchall()
 
     def get_timer(self, user_id: int, timer_id: int):
@@ -138,11 +151,28 @@ class Database:
     def add_timer(self, user_id: int, name: str) -> int:
         cur = self.conn.cursor()
         cur.execute(
-            "INSERT INTO timers (user_id, name, created_at) VALUES (?, ?, ?)",
-            (user_id, name, datetime.now(timezone.utc).isoformat())
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM timers WHERE user_id=?",
+            (user_id,)
+        )
+        next_order = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO timers (user_id, name, sort_order, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, name, next_order, datetime.now(timezone.utc).isoformat())
         )
         self.conn.commit()
         return cur.lastrowid
+
+    def swap_timer_sort_order(self, user_id: int, timer_id_a: int, timer_id_b: int):
+        cur = self.conn.cursor()
+        cur.execute("SELECT sort_order FROM timers WHERE id=? AND user_id=?", (timer_id_a, user_id))
+        row_a = cur.fetchone()
+        cur.execute("SELECT sort_order FROM timers WHERE id=? AND user_id=?", (timer_id_b, user_id))
+        row_b = cur.fetchone()
+        if not row_a or not row_b:
+            return
+        cur.execute("UPDATE timers SET sort_order=? WHERE id=?", (row_b["sort_order"], timer_id_a))
+        cur.execute("UPDATE timers SET sort_order=? WHERE id=?", (row_a["sort_order"], timer_id_b))
+        self.conn.commit()
 
     def rename_timer(self, user_id: int, timer_id: int, new_name: str):
         cur = self.conn.cursor()
@@ -195,6 +225,30 @@ class Database:
             (user_id, timer_id, start_iso, end_iso, duration)
         )
         self.conn.commit()
+
+    def stop_timer_and_add_session(self, timer_id: int, add_seconds: int,
+                                   user_id: int, start_iso: str, end_iso: str, duration: int):
+        """停止计时器并写入会话, 两步在同一事务内完成, 避免崩溃时产生不一致状态."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "UPDATE timers SET total_seconds=total_seconds+?, is_running=0, "
+            "last_start_ts=NULL, last_checkpoint_ts=NULL WHERE id=?",
+            (add_seconds, timer_id)
+        )
+        cur.execute(
+            "INSERT INTO sessions (user_id, timer_id, start_ts, end_ts, duration_seconds) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, timer_id, start_iso, end_iso, duration)
+        )
+        self.conn.commit()
+
+    def sum_sessions(self, user_id: int, timer_id: int) -> int:
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT COALESCE(SUM(duration_seconds), 0) AS s FROM sessions WHERE user_id=? AND timer_id=?",
+            (user_id, timer_id)
+        )
+        return cur.fetchone()["s"]
 
     def query_sessions(self, user_id: int, timer_id: int, start_iso: str, end_iso: str):
         cur = self.conn.cursor()

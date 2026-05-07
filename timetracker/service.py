@@ -17,6 +17,7 @@ from .db import Database, LOCAL_USER_ID
 # 偏好默认值
 # ============================================================
 DEFAULT_TIMEZONES = ["Europe/Paris", "Asia/Shanghai"]
+DEFAULT_SORT_MODE = "manual"   # manual | auto_total_desc
 DEFAULT_POMODORO = {
     "work_minutes": 25,
     "short_break_minutes": 5,
@@ -122,6 +123,32 @@ class TimerService:
         return sorted(tz for tz in available_timezones() if q in tz.lower())[:limit]
 
     # ============================================================
+    # 偏好: 排序
+    # ============================================================
+    def get_sort_mode(self) -> str:
+        raw = self.db.get_pref(self.user_id, "sort_mode")
+        return raw if raw in ("manual", "auto_total_desc") else DEFAULT_SORT_MODE
+
+    def set_sort_mode(self, mode: str):
+        if mode in ("manual", "auto_total_desc"):
+            self.db.set_pref(self.user_id, "sort_mode", mode)
+
+    def move_timer(self, timer_id: int, direction: int) -> bool:
+        """手动排序时上移(direction=-1)或下移(direction=+1). 返回是否成功移动."""
+        if self.get_sort_mode() != "manual":
+            return False
+        timers = self.db.list_timers(self.user_id)
+        ids = [t["id"] for t in timers]
+        if timer_id not in ids:
+            return False
+        idx = ids.index(timer_id)
+        new_idx = idx + direction
+        if new_idx < 0 or new_idx >= len(ids):
+            return False
+        self.db.swap_timer_sort_order(self.user_id, ids[idx], ids[new_idx])
+        return True
+
+    # ============================================================
     # 偏好: 番茄钟
     # ============================================================
     def get_pomodoro_config(self) -> dict:
@@ -157,12 +184,12 @@ class TimerService:
             last_start = datetime.fromisoformat(row["last_start_ts"])
             last_cp = datetime.fromisoformat(row["last_checkpoint_ts"])
             session_seconds = max(0, int((last_cp - last_start).total_seconds()))
-            self.db.add_session(
-                self.user_id, row["id"],
+            # 原子操作: 停止计时器与写入会话在同一事务, 避免中途崩溃导致"已有 session 但 is_running 仍为 1"
+            self.db.stop_timer_and_add_session(
+                row["id"], 0, self.user_id,
                 last_start.isoformat(), last_cp.isoformat(),
                 session_seconds
             )
-            self.db.mark_timer_stopped(row["id"], 0)  # checkpoint 之前的进度已在 total_seconds
             recovered.append(row["name"])
         return recovered
 
@@ -232,8 +259,10 @@ class TimerService:
         now = datetime.now(timezone.utc)
         delta = max(0, int((now - last_cp).total_seconds()))
         session_seconds = max(0, int((now - last_start).total_seconds()))
-        self.db.mark_timer_stopped(timer_id, delta)
-        self.db.add_session(self.user_id, timer_id, last_start.isoformat(), now.isoformat(), session_seconds)
+        self.db.stop_timer_and_add_session(
+            timer_id, delta, self.user_id,
+            last_start.isoformat(), now.isoformat(), session_seconds
+        )
 
     def checkpoint_all_running(self):
         """每隔 N 秒把所有运行中计时器的进度落盘"""
@@ -267,9 +296,13 @@ class TimerService:
     def _seconds_in_period(self, timer_id: int, start_utc: datetime, end_utc: datetime) -> int:
         rows = self.db.query_sessions(self.user_id, timer_id, start_utc.isoformat(), end_utc.isoformat())
         total = 0
+        latest_session_end: Optional[datetime] = None
         for row in rows:
             s = datetime.fromisoformat(row["start_ts"])
             e = datetime.fromisoformat(row["end_ts"])
+            # 记录未裁剪的最晚 end_ts, 用于防止运行中部分与已有 session 重叠
+            if latest_session_end is None or e > latest_session_end:
+                latest_session_end = e
             if s < start_utc:
                 s = start_utc
             if e > end_utc:
@@ -281,6 +314,9 @@ class TimerService:
         t = self.db.get_timer(self.user_id, timer_id)
         if t and t["is_running"] and t["last_start_ts"]:
             ls = datetime.fromisoformat(t["last_start_ts"])
+            # 若已有 session 覆盖了本次运行的起点(不一致状态), 从 session 结束点开始算
+            if latest_session_end and latest_session_end > ls:
+                ls = latest_session_end
             now = datetime.now(timezone.utc)
             s = max(ls, start_utc)
             e = min(now, end_utc)
@@ -295,10 +331,14 @@ class TimerService:
         month_s, _ = self._period_bounds_utc("month")
         result = []
         for t in timers:
-            total = t["total_seconds"]
-            if t["is_running"] and t["last_checkpoint_ts"]:
-                last_cp = datetime.fromisoformat(t["last_checkpoint_ts"])
-                total += max(0, int((datetime.now(timezone.utc) - last_cp).total_seconds()))
+            # total_seconds 因 checkpoint 的 int() 截断会累积误差, 直接从 sessions 表求和更准确
+            sessions_sum = self.db.sum_sessions(self.user_id, t["id"])
+            if t["is_running"] and t["last_start_ts"]:
+                last_start = datetime.fromisoformat(t["last_start_ts"])
+                now_for_total = datetime.now(timezone.utc)
+                total = sessions_sum + max(0, int((now_for_total - last_start).total_seconds()))
+            else:
+                total = sessions_sum
             result.append(TimerView(
                 id=t["id"],
                 name=t["name"],
@@ -308,6 +348,8 @@ class TimerService:
                 week_seconds=self._seconds_in_period(t["id"], week_s, now_utc),
                 month_seconds=self._seconds_in_period(t["id"], month_s, now_utc),
             ))
+        if self.get_sort_mode() == "auto_total_desc":
+            result.sort(key=lambda v: v.total_seconds, reverse=True)
         return result
 
     # ============================================================
