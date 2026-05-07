@@ -11,6 +11,7 @@ DB_PATH = Path.home() / ".timetracker.db"
 def main():
     db = Database(DB_PATH)
     service = TimerService(db, user_id=LOCAL_USER_ID)
+    service.load_language()
     app = TimeTrackerApp(service)
     app.run()
 

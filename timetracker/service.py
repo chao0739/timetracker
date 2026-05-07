@@ -11,6 +11,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo, available_timezones
 
 from .db import Database, LOCAL_USER_ID
+from . import i18n
 
 
 # ============================================================
@@ -149,6 +150,24 @@ class TimerService:
         return True
 
     # ============================================================
+    # 偏好: 语言
+    # ============================================================
+    def get_language(self) -> str:
+        raw = self.db.get_pref(self.user_id, "language")
+        if raw in i18n.LANGS:
+            return raw
+        return "zh"
+
+    def set_language(self, lang: str):
+        if lang in i18n.LANGS:
+            self.db.set_pref(self.user_id, "language", lang)
+            i18n.set_lang(lang)
+
+    def load_language(self):
+        """启动时将已保存的语言设置应用到 i18n 模块"""
+        i18n.set_lang(self.get_language())
+
+    # ============================================================
     # 偏好: 番茄钟
     # ============================================================
     def get_pomodoro_config(self) -> dict:
@@ -199,52 +218,49 @@ class TimerService:
     def create_timer(self, name: str) -> tuple[bool, str]:
         name = name.strip()
         if not name:
-            return False, "名称不能为空"
+            return False, i18n.t("name_empty")
         try:
             self.db.add_timer(self.user_id, name)
-            return True, f"已新建: {name}"
+            return True, i18n.t("created", name=name)
         except Exception as e:
             if "UNIQUE" in str(e):
-                return False, f"名称已存在: {name}"
-            return False, f"错误: {e}"
+                return False, i18n.t("name_exists", name=name)
+            return False, i18n.t("error", err=e)
 
     def rename_timer(self, timer_id: int, new_name: str) -> tuple[bool, str]:
         new_name = new_name.strip()
         if not new_name:
-            return False, "名称不能为空"
+            return False, i18n.t("name_empty")
         try:
             self.db.rename_timer(self.user_id, timer_id, new_name)
-            return True, f"已重命名为: {new_name}"
+            return True, i18n.t("renamed", name=new_name)
         except Exception as e:
             if "UNIQUE" in str(e):
-                return False, f"名称已存在: {new_name}"
-            return False, f"错误: {e}"
+                return False, i18n.t("name_exists", name=new_name)
+            return False, i18n.t("error", err=e)
 
     def delete_timer(self, timer_id: int) -> tuple[bool, str]:
         t = self.db.get_timer(self.user_id, timer_id)
         if not t:
-            return False, "计时器不存在"
+            return False, i18n.t("not_found")
         if t["is_running"]:
             self.stop_timer(timer_id)
         self.db.delete_timer(self.user_id, timer_id)
-        return True, f"已删除: {t['name']}"
+        return True, i18n.t("deleted", name=t["name"])
 
     def toggle_timer(self, timer_id: int) -> tuple[bool, str, int]:
-        """
-        启动/暂停切换. 返回 (success, message, running_count_after).
-        running_count_after 用于 UI 提示"现在有 N 个在跑"
-        """
+        """启动/暂停切换. 返回 (success, message, running_count_after)."""
         t = self.db.get_timer(self.user_id, timer_id)
         if not t:
-            return False, "计时器不存在", 0
+            return False, i18n.t("not_found"), 0
         if t["is_running"]:
             self.stop_timer(timer_id)
             running = len(self.db.list_running_timers(self.user_id))
-            return True, f"已暂停: {t['name']}", running
+            return True, i18n.t("stopped", name=t["name"]), running
         else:
             self.start_timer(timer_id)
             running = len(self.db.list_running_timers(self.user_id))
-            return True, f"已启动: {t['name']}", running
+            return True, i18n.t("started", name=t["name"]), running
 
     def start_timer(self, timer_id: int):
         now_iso = datetime.now(timezone.utc).isoformat()
